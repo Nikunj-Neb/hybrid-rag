@@ -183,7 +183,7 @@ def answer_question(question: str, mode: str = "hybrid"):
     )
     client = ai_client()
     response = client.models.generate_content(
-        model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+        model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
         contents=f"Question:\n{question}\n\nRetrieved passages:\n{context}",
         config=types.GenerateContentConfig(system_instruction=instruction, temperature=0.2),
     )
