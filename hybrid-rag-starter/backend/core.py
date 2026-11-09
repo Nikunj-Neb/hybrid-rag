@@ -4,18 +4,20 @@ import re
 import sqlite3
 import uuid
 from pathlib import Path
+from contextlib import contextmanager
 from typing import Any
 
 from google import genai
 from google.genai import types
 from qdrant_client import QdrantClient, models
-from rank_bm25 import BM25Okapi
+from rank_bm25 import BM25Plus
 
 EMBEDDING_DIM = 768
 COLLECTION = os.getenv("QDRANT_COLLECTION", "hybrid_rag_chunks")
 DB_PATH = os.getenv("DB_PATH", "./data/chunks.sqlite3")
 
 
+@contextmanager
 def db_connection():
     path = Path(DB_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -27,7 +29,11 @@ def db_connection():
     )""")
     con.execute("CREATE INDEX IF NOT EXISTS idx_document ON chunks(document_id)")
     con.commit()
-    return con
+    try:
+        with con:
+            yield con
+    finally:
+        con.close()
 
 
 def ai_client():
@@ -70,6 +76,8 @@ def tokenize(text: str):
 
 def chunk_text(text: str, max_chars: int = 1200, overlap: int = 160):
     """Simple character-based baseline. Advanced chunking comes later."""
+    if max_chars <= 0 or overlap < 0 or overlap >= max_chars:
+        raise ValueError("Require max_chars > 0 and 0 <= overlap < max_chars")
     clean = re.sub(r"[ \t]+", " ", text).strip()
     if not clean:
         return []
@@ -127,6 +135,8 @@ def reciprocal_rank_fusion(rankings: list[list[str]], k: int = 60):
 
 
 def retrieve(question: str, limit: int = 5, mode: str = "hybrid"):
+    if mode not in ("hybrid", "semantic", "keyword"):
+        raise ValueError("Invalid retrieval mode")
     with db_connection() as con:
         rows = [dict(row) for row in con.execute("SELECT * FROM chunks")]
     if not rows:
@@ -136,9 +146,13 @@ def retrieve(question: str, limit: int = 5, mode: str = "hybrid"):
     dense_rank: list[str] = []
     if mode in ("hybrid", "keyword"):
         tokens = [tokenize(r["body"]) or [""] for r in rows]
-        bm25 = BM25Okapi(tokens)
-        scores = bm25.get_scores(tokenize(question))
-        bm25_rank = [rows[i]["id"] for i in sorted(range(len(rows)), key=lambda i: scores[i], reverse=True) if scores[i] > 0][:20]
+        # Positive IDF keeps matches useful even with only one uploaded chunk.
+        bm25 = BM25Plus(tokens)
+        query_tokens = tokenize(question)
+        scores = bm25.get_scores(query_tokens)
+        query_terms = set(query_tokens)
+        bm25_rank = [rows[i]["id"] for i in sorted(range(len(rows)), key=lambda i: scores[i], reverse=True)
+                     if query_terms.intersection(tokens[i])][:20]
     if mode in ("hybrid", "semantic"):
         qc = qdrant_client()
         search_result = qc.query_points(
