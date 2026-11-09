@@ -47,12 +47,12 @@ cd backend
 
 ## Pipeline
 
-1. Upload a text-readable PDF/TXT/MD (8MB max; PDF max 100 pages).
+1. Upload a text-readable PDF/TXT/MD (8MB max; PDF max 100 pages), with local OCR for missing or broken text layers.
 2. Parse per-page text, divide into overlapping character chunks.
 3. Embed each chunk with Gemini `gemini-embedding-001` using `RETRIEVAL_DOCUMENT` (768 dimensions).
 4. Store dense embeddings in Qdrant, plus all chunk text/metadata in local SQLite.
 5. On question, embed question with `RETRIEVAL_QUERY` and search Qdrant; independently score all local chunks with BM25.
-6. Fuse both top-20 rankings using RRF (k=60), select top 5.
+6. Fuse both top-60 rankings using RRF (k=60), select top 12. Include entire matched documents within a 40,000-character budget; otherwise include the ranked chunks and their neighbors.
 7. Send retrieved context to Gemini Flash; return answer and source snippets.
 
 Use the UI dropdown to compare **Hybrid**, **Semantic only**, and **Keyword only** modes.
@@ -71,7 +71,7 @@ Use the UI dropdown to compare **Hybrid**, **Semantic only**, and **Keyword only
 - **Local SQLite is the BM25 index source**, while **Qdrant Cloud stores dense embeddings**. This is genuine hybrid retrieval, but not a Qdrant-native dual-index implementation. For multi-instance cloud hosting, move BM25 and metadata to a shared database/search service or Qdrant's sparse vectors.
 - Local SQLite and remote Qdrant can get out of sync after a partial ingestion failure. Implement rollback/reconciliation and document deletion before production.
 - Not designed for public deployment as-is: no user authentication, no document isolation, no rate limiting, no antivirus/file sanitization, no abuse protection, no scheduled backups. Do not upload confidential material or expose this API publicly.
-- The document parser does not perform OCR. Scanned PDFs without embedded text cannot be processed.
+- The PDF parser uses local OCR when the embedded text is missing or corrupted. OCR can be slow and may misread equations; verify formulas against the original PDF.
 - One embedding request per chunk, so long files can be slow or reach Gemini quotas. Monitor costs and rate limits.
 - Citations are model-generated source labels and should be verified against displayed excerpts; they are not independently proof-checked.
 - API key must remain in `backend/.env`; never embed in frontend and do not commit secrets.

@@ -49,9 +49,47 @@ def test_answer_sources(client, monkeypatch):
     from types import SimpleNamespace
     monkeypatch.setattr(core, "retrieve", lambda *a, **kw: [
         {"filename": "notes.pdf", "page": 2, "body": "Qdrant stores vectors"}])
+    monkeypatch.setattr(core, "expand_context", lambda rows: rows)
     monkeypatch.setattr(core, "ai_client", lambda: SimpleNamespace(models=SimpleNamespace(
         generate_content=lambda **kw: SimpleNamespace(text="Qdrant stores vectors [1]."))))
     result = client.post("/chat", json={"question": "What does Qdrant store?"}).json()
     assert result["sources"][0]["page"] == 2
     assert result["sources"][0]["number"] == 1
     assert "[1]" in result["answer"]
+
+
+def test_application_question_ignores_filler_words(client):
+    with core.db_connection() as con:
+        con.executemany("INSERT INTO chunks VALUES (?, ?, ?, ?, ?)", [
+            ("intro", "doc", "notes.pdf", 1, "Tell me about the history of thermodynamics"),
+            ("scope", "doc", "notes.pdf", 9, "Practical applications include engines and refrigeration"),
+        ])
+    rows = core.retrieve("whats the use of thermodynamics", mode="keyword")
+    assert rows[0]["id"] == "scope"
+
+
+def test_small_document_context_includes_late_page(client):
+    with core.db_connection() as con:
+        con.executemany("INSERT INTO chunks VALUES (?, ?, ?, ?, ?)", [
+            ("first", "doc", "notes.pdf", 1, "Introduction"),
+            ("late", "doc", "notes.pdf", 20, "Applications include heat engines"),
+            ("other", "other", "private.pdf", 1, "Unrelated document"),
+        ])
+    sources = [{"id": "first", "document_id": "doc", "filename": "notes.pdf", "page": 1, "body": "Introduction"}]
+    assert [r["id"] for r in core.expand_context(sources)] == ["first", "late"]
+
+
+def test_large_context_respects_budget(client):
+    rows = [{"id": str(i), "document_id": "doc", "filename": "notes.pdf", "page": i + 1, "body": "text " * 100} for i in range(8)]
+    with core.db_connection() as con:
+        con.executemany("INSERT INTO chunks VALUES (:id, :document_id, :filename, :page, :body)", rows)
+    selected = core.expand_context([rows[3]], max_chars=1900)
+    assert selected[0]["id"] == "3"
+    assert len({r["id"] for r in selected}) == len(selected)
+    assert sum(len(r["body"]) + len(r["filename"]) + 100 for r in selected) <= 1900
+
+
+def test_broken_pdf_text_triggers_ocr():
+    from pdf_text import readable_text
+    assert not readable_text('!" /0&!-#5&!&B(&*(!#6!$&%�()#*! ' * 10)
+    assert readable_text('Thermodynamics describes energy transfer between a system and its surroundings.')

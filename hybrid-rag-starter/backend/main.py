@@ -1,4 +1,3 @@
-import io
 import os
 from contextlib import asynccontextmanager
 
@@ -8,9 +7,10 @@ load_dotenv()
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from pypdf import PdfReader
+from starlette.concurrency import run_in_threadpool
 
 from core import answer_question, db_connection, store_document
+from pdf_text import extract_pdf
 
 MAX_UPLOAD = 8 * 1024 * 1024
 
@@ -49,13 +49,10 @@ async def upload(file: UploadFile = File(...)):
         raise HTTPException(413, "Maximum upload size is 8 MB")
     try:
         if ext == ".pdf":
-            pdf = PdfReader(io.BytesIO(raw))
-            if len(pdf.pages) > 100:
-                raise HTTPException(400, "Maximum 100 PDF pages")
-            pages = [(i + 1, page.extract_text() or "") for i, page in enumerate(pdf.pages)]
+            pages = await run_in_threadpool(extract_pdf, raw)
         else:
             pages = [(None, raw.decode("utf-8-sig"))]
-        return store_document(name, pages)
+        return await run_in_threadpool(store_document, name, pages)
     except HTTPException:
         raise
     except (ValueError, UnicodeDecodeError) as exc:

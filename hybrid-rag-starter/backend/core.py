@@ -135,11 +135,55 @@ def reciprocal_rank_fusion(rankings: list[list[str]], k: int = 60):
     return sorted(scores, key=scores.get, reverse=True)
 
 
-def retrieve(question: str, limit: int = 5, mode: str = "hybrid"):
+STOP_WORDS = set("a an the is are was were of in on to for and or about me tell what whats how does do can it my".split())
+
+
+def search_tokens(question: str):
+    terms = [term for term in tokenize(question) if term not in STOP_WORDS]
+    # Expand common question wording without another model call.
+    if set(terms) & {"use", "uses", "used", "application", "applications", "purpose"}:
+        terms.extend(["use", "uses", "applications", "application", "scope", "practical", "purpose"])
+    return list(dict.fromkeys(terms))
+
+
+def expand_context(sources, max_chars=40000):
+    """Read entire matched documents when small; otherwise include nearby chunks.
+
+    The budget includes citation labels. Every returned passage has a source label.
+    """
+    if not sources:
+        return []
+    document_ids = list(dict.fromkeys(row["document_id"] for row in sources))
+    with db_connection() as con:
+        rows = [dict(row) for row in con.execute(
+            "SELECT * FROM chunks WHERE document_id IN (" + ",".join("?" for _ in document_ids) + ") ORDER BY rowid",
+            document_ids)]
+    cost = lambda row: len(row["body"]) + len(row["filename"]) + 100
+    if sum(cost(row) for row in rows) <= max_chars:
+        return rows
+    ordered = list(sources)
+    positions = {row["id"]: i for i, row in enumerate(rows)}
+    for source in sources:
+        index = positions.get(source["id"])
+        if index is not None:
+            for offset in (-1, 1):
+                neighbor = index + offset
+                if 0 <= neighbor < len(rows) and rows[neighbor]["document_id"] == source["document_id"]:
+                    ordered.append(rows[neighbor])
+    selected, seen, used = [], set(), 0
+    for row in ordered:
+        if row["id"] not in seen and used + cost(row) <= max_chars:
+            selected.append(row)
+            seen.add(row["id"])
+            used += cost(row)
+    return selected
+
+
+def retrieve(question: str, limit: int = 12, mode: str = "hybrid"):
     if mode not in ("hybrid", "semantic", "keyword"):
         raise ValueError("Invalid retrieval mode")
     with db_connection() as con:
-        rows = [dict(row) for row in con.execute("SELECT * FROM chunks")]
+        rows = [dict(row) for row in con.execute("SELECT * FROM chunks ORDER BY rowid")]
     if not rows:
         return []
     by_id = {row["id"]: row for row in rows}
@@ -149,16 +193,16 @@ def retrieve(question: str, limit: int = 5, mode: str = "hybrid"):
         tokens = [tokenize(r["body"]) or [""] for r in rows]
         # Positive IDF keeps matches useful even with only one uploaded chunk.
         bm25 = BM25Plus(tokens)
-        query_tokens = tokenize(question)
+        query_tokens = search_tokens(question)
         scores = bm25.get_scores(query_tokens)
         query_terms = set(query_tokens)
         bm25_rank = [rows[i]["id"] for i in sorted(range(len(rows)), key=lambda i: scores[i], reverse=True)
-                     if query_terms.intersection(tokens[i])][:20]
+                     if query_terms.intersection(tokens[i])][:60]
     if mode in ("hybrid", "semantic"):
         qc = qdrant_client()
         search_result = qc.query_points(
             collection_name=COLLECTION, query=embed(question, "RETRIEVAL_QUERY"),
-            limit=20, with_payload=False,
+            limit=60, with_payload=False,
         )
         dense_rank = [str(hit.id) for hit in search_result.points if str(hit.id) in by_id]
     if mode == "hybrid":
@@ -169,7 +213,7 @@ def retrieve(question: str, limit: int = 5, mode: str = "hybrid"):
 
 
 def answer_question(question: str, mode: str = "hybrid"):
-    sources = retrieve(question, mode=mode)
+    sources = expand_context(retrieve(question, mode=mode))
     if not sources:
         return {"answer": "I couldn't find relevant material in the uploaded documents.", "sources": []}
     context = "\n\n".join(
